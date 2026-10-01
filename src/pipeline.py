@@ -11,10 +11,17 @@ import numpy as np
 import torch
 
 from src.graph_builder import build_graph
-from src.localization import localize
+from src.localization import localize, render_line_debug
 from src.model import classify_bgr_crops, load_checkpoint
 from src.ocr import SHAPE_CLASSES, ShapeOCR
-from src.relationships import ArrowRef, ShapeRef, match_arrows_to_shapes
+from src.relationships import (
+    ArrowRef,
+    MatchDebug,
+    ShapeRef,
+    collect_arrow_refs,
+    match_arrows_to_shapes,
+    render_relationship_debug,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WEIGHTS = PROJECT_ROOT / "models" / "shape_classifier.pth"
@@ -29,6 +36,8 @@ class PipelineResult:
     n_arrows_classified: int
     n_edges: int
     log_lines: list[str] = field(default_factory=list)
+    n_hough_lines: int = 0
+    debug_image_path: str | None = None
 
 
 def _bbox_contained(
@@ -82,6 +91,8 @@ def run_pipeline(
     weights: Path | None = None,
     ocr_min_confidence: float = 0.25,
     ocr_gpu: bool = False,
+    debug_dir: Path | None = None,
+    skip_ocr: bool = False,
 ) -> PipelineResult:
     """Run Stages 1–6 on a BGR whiteboard photo and return a NetworkX graph."""
     log: list[str] = []
@@ -95,7 +106,8 @@ def run_pipeline(
 
     loc = localize(image)
     log.append(
-        f"Localized {len(loc.shapes)} compact and {len(loc.arrows)} elongated contour(s)."
+        f"Localized {len(loc.shapes)} compact and {len(loc.arrows)} elongated contour(s); "
+        f"{len(loc.raw_lines)} raw Hough line(s) merged to {len(loc.lines)} connector(s)."
     )
 
     preds = classify_bgr_crops([c.crop for c in loc.all_candidates], model, device)
@@ -118,6 +130,8 @@ def run_pipeline(
             node_id += 1
         elif label == "arrow":
             arrow_refs.append(ArrowRef(contour=cand.contour, bbox=cand.bbox))
+    n_contour_arrows = len(arrow_refs)
+    arrow_refs = collect_arrow_refs(arrow_refs, loc.lines)
 
     before = len(shape_nodes)
     shape_nodes = drop_nested_shape_nodes(shape_nodes)
@@ -125,25 +139,59 @@ def run_pipeline(
         log.append(f"Dropped {before - len(shape_nodes)} nested crop(s) (interior text).")
 
     log.append(
-        f"Classifier kept {len(shape_nodes)} shape node(s) and {len(arrow_refs)} arrow(s)."
+        f"Classifier kept {len(shape_nodes)} shape node(s) and {n_contour_arrows} contour arrow(s); "
+        f"matching uses {len(arrow_refs)} shaft candidate(s) including Hough lines."
     )
 
-    engine = ocr or ShapeOCR(min_confidence=ocr_min_confidence, gpu=ocr_gpu)
-    for node in shape_nodes:
-        result = engine.read_shape(node["crop"], node["id"])
-        node["label"] = result.text
-        log.append(
-            f"OCR node {node['id']} ({node['shape_type']}): {result.text!r}"
-            f"{' [fallback]' if result.used_fallback else ''}"
-        )
+    if not skip_ocr:
+        engine = ocr or ShapeOCR(min_confidence=ocr_min_confidence, gpu=ocr_gpu)
+        for node in shape_nodes:
+            result = engine.read_shape(node["crop"], node["id"])
+            node["label"] = result.text
+            log.append(
+                f"OCR node {node['id']} ({node['shape_type']}): {result.text!r}"
+                f"{' [fallback]' if result.used_fallback else ''}"
+            )
 
     h, w = image.shape[:2]
-    max_dist = 0.22 * float(np.hypot(w, h))
     shape_refs = [
         ShapeRef(node_id=n["id"], bbox=n["bbox"], contour=n["contour"]) for n in shape_nodes
     ]
-    matches = match_arrows_to_shapes(arrow_refs, shape_refs, max_endpoint_distance=max_dist)
-    log.append(f"Matched {len(matches)} undirected edge(s).")
+    match_debug = MatchDebug()
+    matches = match_arrows_to_shapes(
+        arrow_refs,
+        shape_refs,
+        max_endpoint_distance=None,
+        image_size=(h, w),
+        debug=match_debug,
+        verbose=False,
+    )
+    log.append(
+        f"Matched {len(matches)} undirected edge(s) "
+        f"(max endpoint dist={match_debug.max_endpoint_distance:.1f}px, "
+        f"rejected={len(match_debug.rejected)})."
+    )
+
+    debug_path = None
+    if debug_dir is not None:
+        debug_dir = Path(debug_dir)
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        debug_path = debug_dir / "relationship_debug.png"
+        labels = {n["id"]: str(n.get("label", "")) for n in shape_nodes}
+        render_relationship_debug(
+            image,
+            shape_refs,
+            loc.raw_lines,
+            loc.lines,
+            matches,
+            debug=match_debug,
+            path=debug_path,
+            labels=labels,
+        )
+        log.append(f"Wrote relationship debug overlay to {debug_path}")
+        line_path = debug_dir / "line_debug.png"
+        render_line_debug(image, loc, path=line_path)
+        log.append(f"Wrote line-detection debug panel to {line_path}")
 
     graph_nodes = [
         {
@@ -163,9 +211,11 @@ def run_pipeline(
         n_localized_shapes=len(loc.shapes),
         n_localized_arrows=len(loc.arrows),
         n_nodes=graph.number_of_nodes(),
-        n_arrows_classified=len(arrow_refs),
+        n_arrows_classified=n_contour_arrows,
         n_edges=graph.number_of_edges(),
         log_lines=log,
+        n_hough_lines=len(loc.lines),
+        debug_image_path=str(debug_path) if debug_path else None,
     )
 
 

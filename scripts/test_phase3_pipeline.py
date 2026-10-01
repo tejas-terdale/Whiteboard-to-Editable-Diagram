@@ -24,7 +24,14 @@ from src.graph_builder import build_graph, save_graph_json  # noqa: E402
 from src.localization import localize  # noqa: E402
 from src.model import CLASS_NAMES, classify_bgr_crops, load_checkpoint  # noqa: E402
 from src.ocr import SHAPE_CLASSES, ShapeOCR  # noqa: E402
-from src.relationships import ArrowRef, ShapeRef, match_arrows_to_shapes  # noqa: E402
+from src.relationships import (  # noqa: E402
+    ArrowRef,
+    MatchDebug,
+    ShapeRef,
+    collect_arrow_refs,
+    match_arrows_to_shapes,
+    render_relationship_debug,
+)
 
 DEFAULT_WEIGHTS = PROJECT_ROOT / "models" / "shape_classifier.pth"
 DEFAULT_REAL_DIR = PROJECT_ROOT / "data" / "test_real"
@@ -198,14 +205,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"  skip unknown class {label}")
 
+    n_contour_arrows = len(arrow_refs)
+    arrow_refs = collect_arrow_refs(arrow_refs, loc.lines)
+
     before = len(shape_nodes)
     shape_nodes = drop_nested_shape_nodes(shape_nodes)
     if len(shape_nodes) != before:
         print(f"   dropped {before - len(shape_nodes)} nested crop(s) (likely interior text).")
 
     print(
-        f"B. Classifier: {len(shape_nodes)} shape node(s), {len(arrow_refs)} arrow(s) "
-        f"(classes={list(CLASS_NAMES)})."
+        f"B. Classifier: {len(shape_nodes)} shape node(s), {n_contour_arrows} contour arrow(s) "
+        f"+ {len(loc.lines)} Hough connector(s) (classes={list(CLASS_NAMES)})."
     )
 
     # C. OCR on shape crops only
@@ -221,19 +231,43 @@ def main(argv: list[str] | None = None) -> int:
             f"{' [fallback]' if result.used_fallback else ''}"
         )
 
-    # D. Geometric undirected edges
-    diag = float(np.hypot(w, h))
-    max_dist = 0.22 * diag
+    # D. Geometric undirected edges (Hough lines + contour arrows)
     shape_refs = [
         ShapeRef(node_id=n["id"], bbox=n["bbox"], contour=n["contour"]) for n in shape_nodes
     ]
-    matches = match_arrows_to_shapes(arrow_refs, shape_refs, max_endpoint_distance=max_dist)
-    print(f"D. Matched {len(matches)} undirected edge(s) (max endpoint dist={max_dist:.1f}px).")
+    match_debug = MatchDebug()
+    matches = match_arrows_to_shapes(
+        arrow_refs,
+        shape_refs,
+        max_endpoint_distance=None,
+        image_size=(h, w),
+        debug=match_debug,
+        verbose=True,
+    )
+    print(
+        f"D. Matched {len(matches)} undirected edge(s) "
+        f"(adaptive max endpoint dist={match_debug.max_endpoint_distance:.1f}px, "
+        f"{len(match_debug.rejected)} rejected)."
+    )
     for m in matches:
         print(
             f"   {m.node_a} -- {m.node_b}  "
             f"(arrow {m.arrow_index}, d={m.dist_a:.1f}/{m.dist_b:.1f})"
         )
+
+    debug_path = PROJECT_ROOT / "data" / "debug" / "phase3_relationship_debug.png"
+    labels = {n["id"]: str(n.get("label", "")) for n in shape_nodes}
+    render_relationship_debug(
+        image,
+        shape_refs,
+        loc.raw_lines,
+        loc.lines,
+        matches,
+        debug=match_debug,
+        path=debug_path,
+        labels=labels,
+    )
+    print(f"   debug overlay: {debug_path}")
 
     # E. NetworkX graph
     graph_nodes = [
