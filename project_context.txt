@@ -1,0 +1,226 @@
+PROJECT CONTEXT: WHITEBOARD PHOTO TO EDITABLE DIAGRAM
+=======================================================
+This file is the complete, final, decided context for a deep learning course
+project. It is meant to be given to an AI chatbot so that chatbot can generate
+step-by-step build prompts to hand to Cursor or Antigravity (AI coding agents)
+to actually implement the project. Nothing here is undecided — this is the
+final spec. Do not suggest a different architecture; only ask about
+implementation details within this spec.
+
+-------------------------------------------------------------------------------
+1. THE PROBLEM
+-------------------------------------------------------------------------------
+People photograph whiteboards after meetings, lectures, and design sessions,
+but the photo is a static image. It cannot be edited, and arrows/boxes/labels
+cannot be moved, renamed, or exported into diagramming tools like draw.io or
+Lucidchart. Existing OCR tools extract text but ignore diagram structure
+(which shapes connect to which, via which arrows). Photo-cleanup tools
+(Google Photos, scanner apps) enhance the image visually but do not
+understand it as a diagram at all.
+
+-------------------------------------------------------------------------------
+2. THE SOLUTION (ONE SENTENCE)
+-------------------------------------------------------------------------------
+A system that takes a photo of a whiteboard diagram and outputs a fully
+editable digital diagram, by detecting shapes and arrows, reading the text
+inside each shape, figuring out which shapes are connected, and reconstructing
+all of it as an interactive diagram the user can edit and export.
+
+-------------------------------------------------------------------------------
+3. COURSE CONTEXT
+-------------------------------------------------------------------------------
+- Deep learning course project (student is second-year B.Tech, first
+  substantial deep learning project, learning as they go).
+- The project WILL be graded specifically on the deep learning content, so
+  the pipeline must include a genuinely trained/fine-tuned deep learning
+  model, not just calls to pretrained APIs.
+- The project will be built primarily by prompting AI coding agents (Cursor
+  or Antigravity), so the plan below is deliberately structured to avoid
+  any step that requires manual, non-codeable work (e.g. manually
+  photographing and labeling hundreds of training images).
+
+-------------------------------------------------------------------------------
+4. FINAL DECIDED ARCHITECTURE — FULL PIPELINE
+-------------------------------------------------------------------------------
+Stage 1: Preprocessing
+  - Library: OpenCV
+  - Convert to grayscale, apply adaptive thresholding to clean up the image.
+  - Do NOT implement automatic perspective correction (no homography/edge-
+    based deskewing). This was deliberately cut for simplicity. Assume the
+    input photo is reasonably straight-on. Optionally allow the user to
+    manually crop the image in the Streamlit UI before processing.
+
+Stage 2: Shape and arrow localization (classical CV, NOT deep learning)
+  - Library: OpenCV
+  - Use cv2.findContours to find all closed/open contours in the
+    preprocessed image.
+  - Use cv2.approxPolyDP plus geometric filters (aspect ratio, solidity,
+    extent, contour area vs bounding box area) to separate:
+      (a) "shape candidates" — closed contours (these will become nodes)
+      (b) "arrow/line candidates" — thin, elongated, low-solidity contours
+          (these will become edges)
+  - This explicitly replaces a trained object detector (e.g. YOLO). No
+    object detection model is used for localization. This decision was made
+    deliberately to avoid the need to manually collect and label a large
+    object-detection dataset.
+
+Stage 3: Shape/arrow classification — THIS IS THE DEEP LEARNING CORE
+  - This is the one part of the pipeline that must involve an actual trained
+    deep learning model, to satisfy the grading requirement.
+  - Model: a small CNN built via transfer learning on a pretrained backbone
+    (MobileNetV2 recommended for speed and small size; any lightweight
+    pretrained CNN is acceptable).
+  - Classes to classify each cropped candidate region (from Stage 2) into:
+      box, circle, diamond, arrow
+  - Training data: SYNTHETICALLY GENERATED, not manually collected or
+    labeled. Write a script (Python, using OpenCV or PIL) that programmatically
+    draws boxes, circles, diamonds, and arrows with:
+      - randomized rotation
+      - randomized stroke thickness
+      - randomized size/aspect ratio
+      - randomized jitter/wobble on the outline (to mimic hand-drawn
+        imperfection — e.g. add small random perturbations to each point
+        along the shape's outline before drawing)
+      - randomized background noise / slight grayscale variation
+    Generate a few hundred to a couple thousand synthetic images per class,
+    label them automatically at generation time (since the generation script
+    knows what it drew), and use this as the training set.
+  - Fine-tune the pretrained backbone on this synthetic dataset (freeze most
+    base layers, train a small classification head, optionally unfreeze the
+    last few layers for a short additional fine-tuning pass).
+  - After training on synthetic data, validate on a small set of REAL
+    whiteboard photos (10-20 photos taken by the student) to check real-world
+    accuracy, and expect to need light tuning (e.g. more aggressive jitter
+    augmentation, or a confidence threshold adjustment) once real results are
+    seen. This one iteration step is expected and normal — it is not a sign
+    the plan is broken.
+
+Stage 4: Text extraction
+  - Library: PaddleOCR (preferred, handles handwritten/uneven text well).
+  - Fallback if PaddleOCR has installation issues in the build environment:
+    EasyOCR (also a pretrained deep learning OCR model, easier to install).
+    Tesseract is the last-resort fallback but handles handwriting worse.
+  - Run OCR only on the cropped region of each shape classified as a "shape"
+    (box/circle/diamond) from Stage 3, not on arrows, and not on the whole
+    image at once.
+
+Stage 5: Relationship (edge) detection
+  - Pure geometry, no model involved.
+  - For each contour classified as an "arrow" in Stage 3, find its two
+    endpoints (e.g. via cv2.minAreaRect or the extreme points along its
+    principal axis).
+  - For each endpoint, find the nearest "shape" (by distance from the
+    endpoint to the shape's bounding box or contour boundary) and treat that
+    as the connected shape.
+  - Connections are UNDIRECTED. Arrow direction (source vs. target) is
+    deliberately NOT detected in this version — this was descoped as the
+    hardest sub-problem and noted as future work in the report.
+
+Stage 6: Graph construction
+  - Library: NetworkX
+  - Each classified shape becomes a node (labeled with its OCR text from
+    Stage 4).
+  - Each matched arrow-to-shape connection from Stage 5 becomes an
+    undirected edge between two nodes.
+
+Stage 7: Frontend / diagram display and editing
+  - Framework: Streamlit (deliberately chosen over React + FastAPI to avoid
+    frontend engineering complexity irrelevant to a DL course project's
+    grading).
+  - Diagram rendering: Graphviz (via Python's graphviz library, displayed
+    with st.graphviz_chart or by rendering to an image and showing it with
+    st.image).
+  - Editing: implemented via simple Streamlit widgets, NOT a drag-and-drop
+    JS canvas component (explicitly avoid streamlit-agraph / streamlit-flow /
+    React Flow — these were considered and intentionally dropped for
+    simplicity). Editing flow:
+      - A selectbox lets the user pick an existing node.
+      - A text_input lets them rename its label.
+      - Buttons let them delete a node (and its connected edges) or delete
+        an edge.
+      - Optionally, simple inputs let them add a new node and manually
+        connect it to another node.
+      - After any edit, regenerate the Graphviz diagram from the updated
+        NetworkX graph and re-render it.
+
+Stage 8: Export
+  - Use Graphviz's built-in .render() method to export the final diagram
+    directly as PNG or PDF.
+  - Offer the exported file via st.download_button.
+
+-------------------------------------------------------------------------------
+5. WHAT THIS PROJECT DELIBERATELY DOES NOT DO (do not suggest adding these)
+-------------------------------------------------------------------------------
+- Does NOT use YOLO or any object detection model for localization.
+- Does NOT use React, FastAPI, or any separate frontend/backend split —
+  everything runs inside a single Streamlit app.
+- Does NOT use streamlit-agraph, streamlit-flow, or React Flow for the
+  diagram editor — editing is done via basic Streamlit form widgets.
+- Does NOT detect arrow direction (source/target) — all connections are
+  undirected.
+- Does NOT implement automatic perspective correction / deskewing.
+- Does NOT handle multi-page whiteboards, nested/grouped shapes, or diagram
+  types beyond box, circle, diamond, and arrow.
+- Does NOT require manually collecting or labeling a real-photo dataset —
+  training data for the one deep learning model in this pipeline (Stage 3)
+  is synthetically generated by a script.
+
+-------------------------------------------------------------------------------
+6. TECH STACK SUMMARY
+-------------------------------------------------------------------------------
+- Python
+- OpenCV (preprocessing, contour detection, geometric analysis)
+- A pretrained CNN backbone for transfer learning, e.g. MobileNetV2
+  (via TensorFlow/Keras or PyTorch — either is fine, pick whichever the
+  student is more comfortable with or whichever Cursor/Antigravity
+  scaffolds more cleanly)
+- PaddleOCR (primary) or EasyOCR (fallback) for text extraction
+- NetworkX for graph representation
+- Graphviz (Python library) for diagram rendering and export
+- Streamlit for the entire user interface (upload, view, edit, export)
+
+-------------------------------------------------------------------------------
+7. WORKED EXAMPLE (for testing/demo purposes)
+-------------------------------------------------------------------------------
+A user photographs a whiteboard with three boxes — "Start", "Process Data",
+"End" — connected by two arrows in sequence (Start -> Process Data ->
+Process Data -> End). Expected pipeline behavior:
+  1. Upload photo via Streamlit.
+  2. Preprocessing cleans up the image (no perspective correction assumed
+     necessary if photo is reasonably straight).
+  3. Contour detection finds 3 closed shapes and 2 arrow-like contours.
+  4. The trained classifier labels all 3 shapes as "box" and both remaining
+     contours as "arrow".
+  5. OCR reads "Start", "Process Data", "End" from the three box regions.
+  6. Relationship matching correctly links Start–Process Data and
+     Process Data–End (undirected).
+  7. A 3-node, 2-edge graph is built in NetworkX.
+  8. Streamlit displays the diagram via Graphviz; user can rename a
+     mislabeled node or reposition/delete elements via the form widgets.
+  9. User exports as PNG or PDF.
+
+-------------------------------------------------------------------------------
+8. KNOWN LIMITATIONS TO MENTION PROACTIVELY (for report/demo, not blockers)
+-------------------------------------------------------------------------------
+- A classifier trained purely on synthetic data will likely need some
+  accuracy tuning once tested on real handwritten whiteboard photos — this
+  is expected, not a flaw in the plan.
+- No dataset benchmark exists for this exact task/class combination, so
+  evaluation will be done on a small self-collected test set of real
+  whiteboard photos.
+- Arrow direction and multi-page/nested diagrams are explicitly out of scope
+  and can be mentioned as "future work" in the final report.
+
+-------------------------------------------------------------------------------
+9. WHAT I NEED HELP WITH (context for whichever chatbot reads this file)
+-------------------------------------------------------------------------------
+I will use this file to get a chatbot to generate a sequence of clear,
+specific build prompts, which I will then feed one at a time into Cursor or
+Antigravity to actually write the code. Please generate prompts that:
+  - Follow the stage order above (1 through 8).
+  - Are specific enough that an AI coding agent can implement each stage
+    without needing to guess architecture decisions that are already made
+    in this document.
+  - Flag any step where I will need to run something manually (e.g. running
+    the synthetic data generation script, kicking off model training,
+    taking real test photos) versus steps that are pure code generation.
